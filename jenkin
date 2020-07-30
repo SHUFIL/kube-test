@@ -1,0 +1,118 @@
+pipeline {
+    agent {
+        node {
+            label 'awsSlave'
+            customWorkspace '/home/jenkinsslave/workspaces/f-consumer-service'
+        }
+    }
+    environment {
+             ecr_prefix = '11111.dkr.ecr.eu-west-1.amazonaws.com'
+             service_name = 'f-consumer-service'
+             ecr_repo_base = "${ecr_prefix}/${service_name}-base"
+             ecr_repo_dev = "${ecr_prefix}/${service_name}-dev"
+             ecr_repo_rel = "${ecr_prefix}/${service_name}-rel"
+             code_repo = "ssh://git@svc.f.com:2200/f/f-consumer-service.git"
+    }
+    stages{
+        stage('Login to ECR') {
+            steps {
+                sh 'newgrp docker'
+                echo 'Login ecr repositories'
+                sh ' eval $(aws ecr get-login --no-include-email --region eu-west-1)'
+            }
+        }
+        stage('Checkout') {
+            steps {
+                script {
+                    def newScm = [checkout([$class: 'GitSCM', branches: [[name: '*/${branch}']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '8c7bb0ca-3ce3-493f-8bab-66641283866a', url: "ssh://git@svc.f.com:2200/f/f-consumer-service.git"]]])]
+                    def gitCommit = "${newScm.GIT_COMMIT} --short HEAD"
+                    def shortGitCommit = gitCommit[1..10]
+                    env.GIT_COMMIT = shortGitCommit
+                    echo "GIT_COMMIT is ${shortGitCommit}"
+                }
+            }
+        }
+        stage('build base-image') {
+            steps {    
+                script {
+                //check if image exist ... then skip building image
+                //set +e to ignore exit status error if image not exist
+                sh 'set +e && aws ecr list-images  --repository-name "${service_name}"-base |grep "${GIT_COMMIT}" > /dev/null ; echo $? > exitstatus'
+                def exitstatus = readFile('exitstatus').trim()
+                echo "exitstatus is ${exitstatus}"
+                    if ("${exitstatus}" == '1') {
+                        echo "image not exist .... creating image"
+                        echo "GIT_COMMIT is ${env.GIT_COMMIT}"
+                        echo 'starting build stage : docker-base'
+                        withCredentials([string(credentialsId: 'packagist_token', variable: 'packagist_token'), string(credentialsId: 'packagist_user', variable: 'packagist_user')]){                        
+                          sh "docker build -t ${service_name}-base:${GIT_COMMIT} --build-arg packagist_user=${packagist_user} --build-arg packagist_token=${packagist_token} -f ./devops/dockerfile-base . "
+                        }
+                        echo 'Pushing base image to ecr'
+                        sh "docker tag ${service_name}-base:${GIT_COMMIT} ${ecr_repo_base}:${GIT_COMMIT}"
+                        sh "docker tag ${service_name}-base:${GIT_COMMIT} ${service_name}-base:latest"
+                        sh "docker tag ${service_name}-base:${GIT_COMMIT} ${ecr_repo_base}:latest"
+                        sh "docker push ${ecr_repo_base}:${GIT_COMMIT}"
+                        sh "docker push ${ecr_repo_base}:latest"   //temp for current alpha and beta deployment
+                    } else {
+                        echo "base image already exist ... skipping"
+                    }
+                }
+            }
+        }
+        stage('build dev-image') {
+            steps {
+                script {
+                    //check if image exist ... then skip building image
+                    sh 'set +e && aws ecr list-images  --repository-name "${service_name}"-dev |grep "${GIT_COMMIT}" > /dev/null ; echo $? > exitstatus'
+                    def exitstatus = readFile('exitstatus').trim()
+                    echo "exitstatus is ${exitstatus}"
+                    if ("${exitstatus}" == '1') {
+                        echo "dev image not exist .... creating image"
+                        echo 'starting build stage : docker-dev'
+                        withCredentials([string(credentialsId: 'packagist_token', variable: 'packagist_token'), string(credentialsId: 'packagist_user', variable: 'packagist_user')]) {
+                          sh "docker build -t ${service_name}-dev:${GIT_COMMIT} --build-arg packagist_user=${packagist_user} --build-arg packagist_token=${packagist_token } -f ./devops/dockerfile-dev ."
+                        }
+                        echo 'Pushing dev image to ecr'
+                        sh "docker tag ${service_name}-dev:${GIT_COMMIT} ${ecr_repo_dev}:${GIT_COMMIT}"
+                        sh "docker tag ${service_name}-dev:${GIT_COMMIT} ${service_name}-dev:latest"
+                        sh "docker tag ${service_name}-dev:${GIT_COMMIT} ${ecr_repo_dev}:latest"
+                        sh "docker push ${ecr_repo_dev}:${GIT_COMMIT}"
+                        sh "docker push ${ecr_repo_dev}:latest"   //temp for current alpha and beta deployment
+                    } else {
+                        echo "dev image already exist ... skipping"
+                    }
+                }
+            }
+        }
+        stage('test stage') {
+            steps {
+                echo 'This is unit test stage , enabler/disabler for releasing'
+            }
+        }
+        stage('build rel-image') {
+            steps {
+                script {
+                    //check if image exist ... then skip building image
+                    sh 'set +e && aws ecr list-images  --repository-name "${service_name}"-rel |grep "${GIT_COMMIT}" > /dev/null ; echo $? > exitstatus'
+                    def exitstatus = readFile('exitstatus').trim()
+                    echo "exitstatus is ${exitstatus}"
+                    if ("${exitstatus}" == '1') {
+                        echo "rel image not exist .... creating image"
+                        echo 'starting build stage : docker -rel'
+                        withCredentials([string(credentialsId: 'packagist_token', variable: 'packagist_token'), string(credentialsId: 'packagist_user', variable: 'packagist_user')]) {
+                          sh "docker build -t ${service_name}-rel:${GIT_COMMIT} --build-arg packagist_user=${packagist_user} --build-arg packagist_token=${packagist_token} -f ./devops/dockerfile-rel . "
+                        }                        
+                        echo 'Pushing rel image to ecr'
+                        sh "docker tag ${service_name}-rel:${GIT_COMMIT} ${ecr_repo_rel}:${GIT_COMMIT}"
+                        sh "docker tag ${service_name}-rel:${GIT_COMMIT} ${service_name}-rel:latest"
+                        sh "docker tag ${service_name}-rel:latest ${ecr_repo_rel}:latest"
+                        sh "docker push ${ecr_repo_rel}:${GIT_COMMIT}"
+                        sh "docker push ${ecr_repo_rel}:latest"   //temp for current alpha and beta deployment
+                    } else {
+                        echo "rel image already exist ... skipping"
+                    }
+                }
+            }
+        }
+    }
+}
